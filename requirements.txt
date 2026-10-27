@@ -1,0 +1,17 @@
+# Web interface
+streamlit>=1.40,<2
+
+# PDF text extraction (imported as fitz)
+pymupdf>=1.24,<2
+
+# Vector maths for similarity search
+numpy>=1.26,<3
+
+# Google Gemini API (the current official SDK; the older google-generativeai package is deprecated)
+google-genai>=1.0,<2
+
+# Loads the .env file for local development
+python-dotenv>=1.0,<2
+
+# Semantic embeddings. This pulls in PyTorch, which is large. Remove this line to run keyword-only.
+sentence-transformers>=3.0,<6

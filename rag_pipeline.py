@@ -1,0 +1,143 @@
+"""Connects retrieval, answer generation and summaries.
+
+This module contains no Streamlit code, so the whole question-answering flow can be unit tested.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+from chunker import build_summary_source
+from config import MAX_QUESTION_CHARS, MAX_SUMMARY_CHARS, MIN_RELEVANCE_SCORE, TOP_K
+
+NOT_FOUND_MESSAGE = (
+    "This document does not appear to contain enough evidence to answer that question, so no answer "
+    "was generated. Try rephrasing it, or ask about a topic the document covers."
+)
+
+
+def validate_question(question: str | None) -> str:
+    """Return the trimmed question, or raise ValueError with a message for the user."""
+    cleaned = (question or "").strip()
+    if not cleaned:
+        raise ValueError("Type a question before sending.")
+    if len(cleaned) > MAX_QUESTION_CHARS:
+        raise ValueError(f"Keep questions under {MAX_QUESTION_CHARS} characters.")
+    return cleaned
+
+
+@dataclass
+class SourcePassage:
+    number: int  # the [n] number used in the answer text
+    page_label: str
+    score: float
+    text: str
+
+
+@dataclass
+class QAResult:
+    answered: bool
+    answer_text: str = ""
+    sources: list[SourcePassage] = field(default_factory=list)
+    cited: bool = False  # True when the answer contains at least one valid citation
+    message: str = ""  # explanation to show when answered is False
+
+
+def answer_question(index: Any, service: Any, question: str, top_k: int = TOP_K) -> QAResult:
+    """Retrieve evidence, ask the model, and return the answer together with its sources."""
+    cleaned = validate_question(question)
+    threshold = MIN_RELEVANCE_SCORE.get(index.embedder.kind, 0.0)
+    retrieved = index.search(cleaned, top_k=top_k, min_score=threshold)
+    if not retrieved:
+        # Nothing clears the evidence threshold, so the model is never called.
+        return QAResult(answered=False, message=NOT_FOUND_MESSAGE)
+
+    answer = service.answer(cleaned, retrieved)
+    if answer.insufficient_evidence:
+        return QAResult(answered=False, message=NOT_FOUND_MESSAGE)
+
+    passages = [
+        SourcePassage(number=number, page_label=item.chunk.page_label, score=item.score, text=item.chunk.text)
+        for number, item in enumerate(retrieved, start=1)
+    ]
+    if answer.cited_numbers:
+        sources = [passage for passage in passages if passage.number in answer.cited_numbers]
+    else:
+        sources = passages  # no citation found, so show everything the model was given
+    return QAResult(
+        answered=True,
+        answer_text=answer.text,
+        sources=sources,
+        cited=bool(answer.cited_numbers),
+    )
+
+
+def format_page_list(pages: Any, limit: int = 20) -> str:
+    items = list(pages)
+    shown = ", ".join(str(page) for page in items[:limit])
+    return shown + (", ..." if len(items) > limit else "")
+
+
+@dataclass(frozen=True)
+class SummaryResult:
+    markdown: str
+    included_pages: tuple[int, ...]  # pages whose text was sent to the model
+    page_count: int
+    text_page_count: int
+    skipped_pages: tuple[int, ...]  # pages that had no selectable text
+
+    @property
+    def incomplete_notes(self) -> list[str]:
+        notes = []
+        if self.skipped_pages:
+            notes.append(
+                f"{len(self.skipped_pages)} page(s) had no selectable text and were left out: "
+                f"pages {format_page_list(self.skipped_pages)}."
+            )
+        if len(self.included_pages) < self.text_page_count:
+            notes.append(
+                f"This summary covers {len(self.included_pages)} of the {self.text_page_count} pages "
+                "that have text, because the document is too long to send in full."
+            )
+        return notes
+
+
+def summarize_document(service: Any, document: Any, max_chars: int = MAX_SUMMARY_CHARS) -> SummaryResult:
+    source_text, included = build_summary_source(document.pages, max_chars)
+    markdown = service.summarize(document.name, source_text)
+    return SummaryResult(
+        markdown=markdown,
+        included_pages=tuple(included),
+        page_count=document.page_count,
+        text_page_count=document.text_page_count,
+        skipped_pages=tuple(document.skipped_pages),
+    )
+
+
+def safe_file_stem(file_name: str) -> str:
+    """A file name stem that is safe for downloads: letters, digits, underscores and hyphens only."""
+    stem = file_name.rsplit(".", 1)[0] if "." in file_name else file_name
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", stem).strip("_")
+    return cleaned[:60] or "document"
+
+
+def build_summary_file(doc_name: str, summary: SummaryResult) -> str:
+    lines = [f"# Summary of {doc_name}", ""]
+    for note in summary.incomplete_notes:
+        lines.append(f"> Note: {note}")
+    if summary.incomplete_notes:
+        lines.append("")
+    lines.extend(
+        [
+            summary.markdown.strip(),
+            "",
+            "---",
+            "",
+            "_Generated by DocuSense AI with an AI model. Check important dates and requirements "
+            "against the original document._",
+            "",
+        ]
+    )
+    return "\n".join(lines)
